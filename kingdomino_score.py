@@ -8,9 +8,6 @@ from collections import deque
 GRID, CELL = 5, 100
 SIZE = GRID * CELL
 
-TERRAIN = ['Grassland', 'Field', 'Forest', 'Water', 'Swamp', 'Mine', 'Castle', 'Empty']
-
-
 # Cut the 500x500 board into 25 cells of 100x100 px.
 # Returns a list of ((row, col), cell_image), row by row.
 def get_all_cell_rois(board):
