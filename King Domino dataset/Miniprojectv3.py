@@ -35,8 +35,7 @@ def classify_roi_hsv(roi):
     h, s, v = [hsv[..., i].astype(np.float32) for i in range(3)]
     n = h.size
     med_h, med_s, med_v = np.median(h), np.median(s), np.median(v)
-    texture = v[8:-8,8:-8].std()
-    if med_h <= 21 and texture < 16:
+    if med_h <= 21:
         return "Empty", 0.9
 
     water = np.count_nonzero((h >= 95) & (h <= 130) & (s >= 100)) / n
