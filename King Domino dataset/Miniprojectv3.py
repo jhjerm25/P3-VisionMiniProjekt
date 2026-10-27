@@ -5,8 +5,10 @@ import cv2
 import numpy as np
 from collections import deque
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 GRID, CELL = 5, 100
 SIZE = GRID * CELL
+
 
 # Cut the 500x500 board into 25 cells of 100x100 px.
 # Returns a list of ((row, col), cell_image), row by row.
@@ -33,6 +35,9 @@ def classify_roi_hsv(roi):
     h, s, v = [hsv[..., i].astype(np.float32) for i in range(3)]
     n = h.size
     med_h, med_s, med_v = np.median(h), np.median(s), np.median(v)
+    texture = v[8:-8,8:-8].std()
+    if med_h <= 21 and texture < 16:
+        return "Empty", 0.9
 
     water = np.count_nonzero((h >= 95) & (h <= 130) & (s >= 100)) / n
     green = np.count_nonzero((h >= 35) & (h <= 85) & (s >= 60)) / n       # any brightness
@@ -46,8 +51,6 @@ def classify_roi_hsv(roi):
         return ("Forest", green) if med_v < 80 else ("Grassland", green)
     if black >= 0.30:                     # black background and not green = Mine
         return "Mine", black
-    if med_h <= 21:     # wooden table: more orange than a field and smooth
-        return "Empty", 0.9               # (no tile placed here)
     if med_s < 200:                       # swamp is dull beige/brown, a field is saturated yellow
         return "Swamp", beige
     if yellow >= 0.30 or med_s >= 165:
@@ -137,8 +140,47 @@ def group_properties(terrain_grid):
     return groups
 
 
+CROWN_TEMPLATE_PATHS = [(os.path.join(SCRIPT_DIR, "crown.png"),       0.75),
+                        (os.path.join(SCRIPT_DIR, "crown_field.png"), 0.62),
+                        (os.path.join(SCRIPT_DIR, "crown_water.png"), 0.75),
+                        (os.path.join(SCRIPT_DIR, "crown_swamp.png"), 0.72)]
+
+
+def load_crown_templates(paths=CROWN_TEMPLATE_PATHS):
+    templates = []
+    for path, threshold in paths:
+        t = cv2.imread(path)
+        if t is None:
+            raise FileNotFoundError(f"Crown template not found: {path}")
+        templates += [(t,threshold),
+                      (cv2.rotate(t, cv2.ROTATE_90_CLOCKWISE), threshold),
+                      (cv2.rotate(t, cv2.ROTATE_180), threshold),
+                      (cv2.rotate(t, cv2.ROTATE_90_COUNTERCLOCKWISE), threshold)]
+    return templates
+
+CROWN_TEMPLATES = load_crown_templates()
+
+def count_crowns(roi, templates=CROWN_TEMPLATES):
+    found = []
+    for tmpl, threshold in templates:
+        th, tw = tmpl.shape[:2]
+        result = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+        while True:
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val < threshold:
+                break
+            x, y = max_loc
+            too_close = any(abs(x - fx) < tw * 0.7 and abs(y-fy) < th * 0.7
+                            for fx, fy in found)
+            if not too_close:
+                found.append((x, y))
+
+            result[max(0, y - th // 2):y + th // 2,
+                max(0, x - tw // 2):x + tw // 2] = 0
+    return len(found)
+
+
 # Run everything on one board image: classify cells, find the castle,
-# group the properties and count the score (no crowns: 1 point per cell).
 # Also draws the labels on a copy of the board for display.
 def analyse(image_path):
     board = cv2.resize(cv2.imread(image_path), (SIZE, SIZE))
@@ -156,8 +198,13 @@ def analyse(image_path):
     terrain_grid = [[labels[(r, c)] for c in range(GRID)] for r in range(GRID)]
     groups = group_properties(terrain_grid)
 
-    # no crowns: every tile is worth 1, so a property = its size * 1
-    total = sum(len(cells_) * 1 for _, cells_ in groups)
+    crowns = {rc: count_crowns(roi) for rc, roi in cell_rois}
+
+    total = 0
+    for terrain, cells_ in groups:
+        group_crowns = sum(crowns[rc] for rc in cells_)
+        total += len(cells_) * group_crowns
+
 
     visual = board.copy()
     for (r, c), _ in cell_rois:
@@ -166,11 +213,14 @@ def analyse(image_path):
         cv2.rectangle(visual, (x0, y0), (x0 + CELL, y0 + CELL), colour, 2)
         cv2.putText(visual, labels[(r, c)], (x0 + 5, y0 + 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
-    return castle, terrain_grid, groups, total, visual
+        if crowns[(r, c)]:
+            cv2.putText(visual, f"{crowns[(r, c)]}", (x0 + CELL - 22, y0 + CELL - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+    return castle, terrain_grid, groups, crowns, total, visual
 
 
-FOLDER = (r"C:\Users\Jeppe\Downloads\King Domino dataset\King Domino dataset"
-          r"\Cropped and perspective corrected boards")
+FOLDER = os.path.join(SCRIPT_DIR,
+                      "Cropped and perspective corrected boards")
 KEY_SPACE, KEY_ESC = 32, 27
 
 
@@ -183,15 +233,15 @@ def list_boards(folder):
 
 # Print one board's result: castle position, the terrain grid,
 # each property with its size, and the total score.
-def print_result(name, castle, grid, groups, total):
+def print_result(name, castle, grid, groups, crowns, total):
     print(f"\n=== {name} ===")
     print("Castle at (row, col):", castle)
     for row in grid:
         print(" ".join(f"{t[:5]:<9}" for t in row))
     for t, cells_ in groups:
-        print(f"{t:<10} size {len(cells_)}  -> {len(cells_)} x 1 = {len(cells_)}")
-    print("Total (no crowns):", total)
-
+        gc = sum(crowns[rc] for rc in cells_)
+        print(f"{t:<10} size {len(cells_)} x {gc} crowns = {len(cells_) * gc}")
+    print("Total:", total)
 
 # Main: go through every board, print the result and show the image.
 # SPACE shows the next board, ESC or Q quits.
@@ -201,8 +251,8 @@ if __name__ == "__main__":
     print(f"{len(files)} boards found. SPACE = next, ESC or Q = quit.")
 
     for i, name in enumerate(files):
-        castle, grid, groups, total, visual = analyse(os.path.join(folder, name))
-        print_result(name, castle, grid, groups, total)
+        castle, grid, groups, crowns, total, visual = analyse(os.path.join(folder, name))
+        print_result(name, castle, grid, groups, crowns, total)
 
         cv2.imshow("Terrain Classification (HSV)", visual)
         cv2.setWindowTitle("Terrain Classification (HSV)", f"{name}  ({i + 1}/{len(files)})")
